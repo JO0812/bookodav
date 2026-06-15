@@ -19,7 +19,7 @@ export const mimeTypes = {
 
 export const corsHeaders = {
 	"Access-Control-Allow-Origin": "*",
-	"Access-Control-Allow-Methods": "PUT, GET, PROPFIND, OPTIONS",
+	"Access-Control-Allow-Methods": "PUT, GET, POST, DELETE, PROPFIND, OPTIONS",
 	"Access-Control-Allow-Headers": "Authorization, Depth, Content-Type",
 };
 

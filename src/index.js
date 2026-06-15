@@ -5,7 +5,18 @@ import list from '../src/public/dash/list.html'
 import instructions from '../src/public/dash/wiki.html'
 import notfoundpage from '../src/public/dash/404.html'
 import { corsHeaders, is_authorized } from './utils'
-import { dumpCache, handleDeleteFile, handleFileList, handleGetFile, handleMultpleUploads, handlePutFile } from './handlers'
+import {
+	dumpCache,
+	handleDeleteFile,
+	handleFileList,
+	handleGetFile,
+	handleMultpleUploads,
+	handlePutFile,
+	handleMultipartCreate,
+	handleMultipartUploadPart,
+	handleMultipartComplete,
+	handleMultipartAbort,
+} from './handlers'
 // MIME type mapping based on file extensions
 
 const AUTH_REALM = 'BOOKO-DAV';
@@ -90,6 +101,19 @@ export default {
 
 		if (request.method === "GET" && path === "/dumpcache") {
 			return dumpCache(request, env, ctx);
+		}
+
+		if (path === "/multipart/create" && request.method === "POST") {
+			return handleMultipartCreate(request, env, ctx);
+		}
+		if (path === "/multipart/part" && request.method === "PUT") {
+			return handleMultipartUploadPart(request, env, ctx);
+		}
+		if (path === "/multipart/complete" && request.method === "POST") {
+			return handleMultipartComplete(request, env, ctx);
+		}
+		if (path === "/multipart/abort" && request.method === "DELETE") {
+			return handleMultipartAbort(request, env, ctx);
 		}
 
 		if (request.method === "PUT") {

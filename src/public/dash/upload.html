@@ -58,6 +58,26 @@
     [role="status"] {
       background-color: #d4edda;
     }
+
+    .progress-list {
+      margin: 1rem 0;
+    }
+
+    .progress-row {
+      margin-bottom: 0.75rem;
+    }
+
+    .progress-row progress {
+      width: 100%;
+      height: 1rem;
+    }
+
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85rem;
+      opacity: 0.85;
+    }
   </style>
   <title>BOOKO-DAV - Upload</title>
 </head>
@@ -85,6 +105,7 @@
         <!-- Use type="button" to prevent native submission -->
         <button type="submit" id="uploadButton">Upload</button>
       </form>
+      <div id="progressList" class="progress-list"></div>
       <div id="uploadStatus"></div>
     </section>
     <footer class="footer">
@@ -108,6 +129,7 @@
     document.addEventListener('DOMContentLoaded', function () {
       const form = document.getElementById('uploadForm');
       const uploadStatus = document.getElementById('uploadStatus');
+      const progressList = document.getElementById('progressList');
       const uploadButton = document.getElementById('uploadButton');
       const fileInput = document.getElementById('files');
 
@@ -115,12 +137,43 @@
       const allowedTypes = ['epub', 'pdf', 'mobi', 'cbr', 'cbz',
         'jpg', 'jpeg', 'png', 'gif', 'webp'];
 
-      // Maximum file size (100MB)
-      const MAX_FILE_SIZE = 100 * 1024 * 1024;
+      const SIMPLE_UPLOAD_LIMIT = 95 * 1024 * 1024;
+      const MULTIPART_CHUNK_SIZE = 90 * 1024 * 1024;
+      const MAX_FILE_SIZE = 20 * 1024 * 1024 * 1024;
 
       function showError(message) {
         uploadStatus.innerHTML = `<div class="error" role="alert">${message}</div>`;
         uploadStatus.scrollIntoView({ behavior: 'smooth' });
+      }
+
+      function formatBytes(bytes) {
+        if (bytes === 0) return '0 B';
+        const k = 1024;
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + units[i];
+      }
+
+      function makeProgressRow(file) {
+        const row = document.createElement('div');
+        row.className = 'progress-row';
+        row.innerHTML = `
+          <div class="progress-meta">
+            <span class="name"></span>
+            <span class="status">queued</span>
+          </div>
+          <progress value="0" max="100"></progress>
+        `;
+        row.querySelector('.name').textContent = `${file.name} (${formatBytes(file.size)})`;
+        progressList.appendChild(row);
+        const progressEl = row.querySelector('progress');
+        const statusEl = row.querySelector('.status');
+        return {
+          setProgress(pct) { progressEl.value = Math.max(0, Math.min(100, pct)); },
+          setStatus(text) { statusEl.textContent = text; },
+          markError() { row.classList.add('error'); },
+          markSuccess() { row.classList.add('success'); },
+        };
       }
 
       function validateFiles(files) {
@@ -133,23 +186,12 @@
         }
 
         for (const file of files) {
-          // File type validation
-        //  const extension = file.name.split('.').pop().toLowerCase();
-         // if (!allowedTypes.includes(extension)) {
-           // errors.push(`Invalid file type: ${file.name} (${extension})`);
-         // }
-
-          // File size validation
           if (file.size > MAX_FILE_SIZE) {
-            errors.push(`File too large: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB)`);
+            errors.push(`File exceeds 20GB safety cap: ${file.name} (${formatBytes(file.size)})`);
           }
-
-          // Empty file check
           if (file.size === 0) {
             errors.push(`Empty file: ${file.name}`);
           }
-
-          // Duplicate names check
           if (seenNames.has(file.name)) {
             errors.push(`Duplicate filename: ${file.name}`);
           }
@@ -159,64 +201,145 @@
         return errors;
       }
 
+      // ----- Small-file path: existing multi-file /upload endpoint ----------
+      async function uploadSimple(file, ui) {
+        ui.setStatus('uploading');
+        const formData = new FormData();
+        formData.append('files', file);
+        const res = await fetch('/upload', { method: 'POST', body: formData });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const entry = Array.isArray(data) ? data[0] : null;
+        if (!entry || entry.status !== 'success') {
+          throw new Error(entry?.error || 'Upload rejected');
+        }
+        ui.setProgress(100);
+        ui.setStatus('done');
+        ui.markSuccess();
+        return entry.sanitizedFilename || file.name;
+      }
+
+      // ----- Large-file path: R2 multipart via /multipart/* ----------------
+      async function uploadMultipart(file, ui) {
+        const key = file.name.replace(/^\/+/, '');
+        const totalParts = Math.ceil(file.size / MULTIPART_CHUNK_SIZE);
+
+        ui.setStatus(`creating upload (${totalParts} parts)`);
+        const createRes = await fetch(
+          `/multipart/create?key=${encodeURIComponent(key)}`,
+          { method: 'POST' }
+        );
+        if (!createRes.ok) throw new Error(`create failed (HTTP ${createRes.status})`);
+        const { uploadId } = await createRes.json();
+
+        const parts = [];
+        try {
+          for (let i = 0; i < totalParts; i++) {
+            const partNumber = i + 1;
+            const start = i * MULTIPART_CHUNK_SIZE;
+            const end = Math.min(start + MULTIPART_CHUNK_SIZE, file.size);
+            const blob = file.slice(start, end);
+
+            ui.setStatus(`part ${partNumber}/${totalParts}`);
+            const partRes = await fetch(
+              `/multipart/part?key=${encodeURIComponent(key)}` +
+              `&uploadId=${encodeURIComponent(uploadId)}` +
+              `&partNumber=${partNumber}`,
+              { method: 'PUT', body: blob }
+            );
+            if (!partRes.ok) {
+              const txt = await partRes.text().catch(() => '');
+              throw new Error(`part ${partNumber} failed (HTTP ${partRes.status}) ${txt}`);
+            }
+            const partInfo = await partRes.json();
+            parts.push({ partNumber: partInfo.partNumber, etag: partInfo.etag });
+            ui.setProgress(((i + 1) / totalParts) * 100);
+          }
+
+          ui.setStatus('finalizing');
+          const completeRes = await fetch(
+            `/multipart/complete?key=${encodeURIComponent(key)}` +
+            `&uploadId=${encodeURIComponent(uploadId)}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ parts }),
+            }
+          );
+          if (!completeRes.ok) {
+            const txt = await completeRes.text().catch(() => '');
+            throw new Error(`complete failed (HTTP ${completeRes.status}) ${txt}`);
+          }
+
+          ui.setProgress(100);
+          ui.setStatus('done');
+          ui.markSuccess();
+          return key;
+        } catch (err) {
+          try {
+            await fetch(
+              `/multipart/abort?key=${encodeURIComponent(key)}` +
+              `&uploadId=${encodeURIComponent(uploadId)}`,
+              { method: 'DELETE' }
+            );
+          } catch { /* ignore */ }
+          throw err;
+        }
+      }
+
       uploadButton.addEventListener('click', async function (e) {
         e.preventDefault();
         uploadStatus.innerHTML = '';
+        progressList.innerHTML = '';
 
         const files = Array.from(fileInput.files);
         const validationErrors = validateFiles(files);
-
         if (validationErrors.length > 0) {
           showError(validationErrors.join('<br>'));
           return;
         }
 
-        // Disable button during upload
         uploadButton.disabled = true;
         uploadButton.textContent = 'Uploading...';
 
-        const formData = new FormData();
-        files.forEach(file => formData.append('files', file));
+        const successes = [];
+        const failures = [];
 
-        try {
-          const response = await fetch(form.action, {
-            method: 'POST',
-            body: formData
-          });
-
-          const data = await response.json();
-
-          if (!response.ok) throw new Error('Server error');
-
-          // Display results with styling
-          const success = data.filter(item => item.status === 'success');
-          const failures = data.filter(item => item.status === 'failed');
-
-          let resultHtml = `<div class="success" role="status">
-                              <span>Successfully uploaded ${success.length} files:</span>
-                              <ul>${success.map(f => `<li>${f.sanitizedFilename}</li>`).join('')}</ul>`;
-
-          if (failures.length > 0) {
-            resultHtml += `<div class="error" role="alert">
-                             <p>Failed to upload ${failures.length} files:</p>
-                             <ul>${failures.map(f => `<li>${f.filename}: ${f.error}</li>`).join('')}</ul>
-                             </div>`;
+        for (const file of files) {
+          const ui = makeProgressRow(file);
+          try {
+            const name = file.size > SIMPLE_UPLOAD_LIMIT
+              ? await uploadMultipart(file, ui)
+              : await uploadSimple(file, ui);
+            successes.push(name);
+          } catch (err) {
+            ui.setStatus(`failed: ${err.message}`);
+            ui.markError();
+            failures.push({ filename: file.name, error: err.message });
           }
-
-          uploadStatus.innerHTML = resultHtml;
-
-          // Clear form on success
-          if (failures.length === 0) fileInput.value = '';
-
-          // Refresh file list
-          await fetch('/dash/list', { headers: { 'Cache-Control': 'no-cache' } });
-
-        } catch (error) {
-          showError(`Upload failed: ${error.message}`);
-        } finally {
-          uploadButton.disabled = false;
-          uploadButton.textContent = 'Upload';
         }
+
+        let resultHtml = '';
+        if (successes.length > 0) {
+          resultHtml += `<div class="success" role="status">
+                          <span>Successfully uploaded ${successes.length} files:</span>
+                          <ul>${successes.map(n => `<li>${n}</li>`).join('')}</ul>
+                         </div>`;
+        }
+        if (failures.length > 0) {
+          resultHtml += `<div class="error" role="alert">
+                           <p>Failed to upload ${failures.length} files:</p>
+                           <ul>${failures.map(f => `<li>${f.filename}: ${f.error}</li>`).join('')}</ul>
+                         </div>`;
+        }
+        uploadStatus.innerHTML = resultHtml;
+
+        if (failures.length === 0) fileInput.value = '';
+
+        try { await fetch('/dav/list', { headers: { 'Cache-Control': 'no-cache' } }); } catch {}
+
+        uploadButton.disabled = false;
+        uploadButton.textContent = 'Upload';
       });
 
       // Visual feedback for file selection

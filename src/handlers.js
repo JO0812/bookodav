@@ -193,6 +193,115 @@ export async function handleFileList(request, env, ctx) {
     return response;
 }
 
+// Multipart upload endpoints for files larger than the Workers 100MB per-request body limit.
+// Maps onto the R2 multipart API: https://developers.cloudflare.com/r2/api/workers/workers-multipart-usage/
+
+function sanitizeKey(rawKey) {
+    if (!rawKey) return null;
+    const key = decodeURIComponent(rawKey).replace(/^\/+/, "");
+    if (!key || key.includes("..")) return null;
+    return key;
+}
+
+function jsonResponse(body, status = 200) {
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+}
+
+export async function handleMultipartCreate(request, env) {
+    const url = new URL(request.url);
+    const key = sanitizeKey(url.searchParams.get("key"));
+    if (!key) return jsonResponse({ error: "Invalid or missing key" }, 400);
+
+    const extension = key.split(".").pop().toLowerCase();
+    const contentType = mimeTypes[extension] || mimeTypes.default;
+
+    try {
+        const multipart = await env.MY_BUCKET.createMultipartUpload(key, {
+            httpMetadata: { contentType },
+        });
+        return jsonResponse({ key, uploadId: multipart.uploadId });
+    } catch (error) {
+        console.error("multipart create error:", error);
+        return jsonResponse({ error: "Failed to create multipart upload" }, 500);
+    }
+}
+
+export async function handleMultipartUploadPart(request, env) {
+    const url = new URL(request.url);
+    const key = sanitizeKey(url.searchParams.get("key"));
+    const uploadId = url.searchParams.get("uploadId");
+    const partNumber = Number(url.searchParams.get("partNumber"));
+
+    if (!key || !uploadId || !Number.isInteger(partNumber) || partNumber < 1) {
+        return jsonResponse({ error: "Invalid key/uploadId/partNumber" }, 400);
+    }
+    if (!request.body) return jsonResponse({ error: "Missing body" }, 400);
+
+    try {
+        const multipart = env.MY_BUCKET.resumeMultipartUpload(key, uploadId);
+        const uploaded = await multipart.uploadPart(partNumber, request.body);
+        return jsonResponse({ partNumber: uploaded.partNumber, etag: uploaded.etag });
+    } catch (error) {
+        console.error("multipart uploadPart error:", error);
+        return jsonResponse({ error: "Failed to upload part" }, 500);
+    }
+}
+
+export async function handleMultipartComplete(request, env, ctx) {
+    const url = new URL(request.url);
+    const key = sanitizeKey(url.searchParams.get("key"));
+    const uploadId = url.searchParams.get("uploadId");
+
+    if (!key || !uploadId) {
+        return jsonResponse({ error: "Invalid key or uploadId" }, 400);
+    }
+
+    let parts;
+    try {
+        const body = await request.json();
+        parts = body.parts;
+    } catch {
+        return jsonResponse({ error: "Body must be JSON: { parts: [...] }" }, 400);
+    }
+    if (!Array.isArray(parts) || parts.length === 0) {
+        return jsonResponse({ error: "parts must be a non-empty array" }, 400);
+    }
+
+    try {
+        const multipart = env.MY_BUCKET.resumeMultipartUpload(key, uploadId);
+        await multipart.complete(parts);
+
+        const cache = caches.default;
+        const cacheKey = new Request(new URL("/", request.url).toString());
+        ctx.waitUntil(cache.delete(cacheKey));
+
+        return jsonResponse({ key, status: "success" });
+    } catch (error) {
+        console.error("multipart complete error:", error);
+        return jsonResponse({ error: "Failed to complete multipart upload" }, 500);
+    }
+}
+
+export async function handleMultipartAbort(request, env) {
+    const url = new URL(request.url);
+    const key = sanitizeKey(url.searchParams.get("key"));
+    const uploadId = url.searchParams.get("uploadId");
+    if (!key || !uploadId) {
+        return jsonResponse({ error: "Invalid key or uploadId" }, 400);
+    }
+    try {
+        const multipart = env.MY_BUCKET.resumeMultipartUpload(key, uploadId);
+        await multipart.abort();
+        return jsonResponse({ key, status: "aborted" });
+    } catch (error) {
+        console.error("multipart abort error:", error);
+        return jsonResponse({ error: "Failed to abort multipart upload" }, 500);
+    }
+}
+
 export async function dumpCache(request, env, ctx){
     const url = new URL(request.url);
     try {
